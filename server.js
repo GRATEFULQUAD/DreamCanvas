@@ -41,7 +41,6 @@ fs.writeFileSync(filePath, buf);
 });
 
 const PORT = process.env.PORT || 8787;
-"C:\Program Files\Notepad++\notepad++.exe" "%USERPROFILE%\dreamcanvas-server\server.js"
 app.listen(PORT, () => {
   console.log(`DreamCanvas server running on http://localhost:${PORT}`);
 });
