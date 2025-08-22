@@ -9,7 +9,23 @@ const cors = require('cors');
 const FormData = require('form-data');
 // node-fetch (ESM) shim for CommonJS
 const fetch = (...args) => import('node-fetch').then(({ default: f }) => f(...args));
+app.get('/whoami', async (_req, res) => {
+  try {
+    const KEY = (process.env.STABILITY_API_KEY || '').trim();
+    if (!KEY) return res.status(500).json({ ok:false, error:'Missing STABILITY_API_KEY' });
 
+    const r = await fetch('https://api.stability.ai/v1/user/account', {
+      headers: { Authorization: `Bearer ${KEY}` }
+    });
+
+    const txt = await r.text().catch(()=> '');
+    if (!r.ok) return res.status(r.status).json({ ok:false, status:r.status, msg: txt.slice(0,400) });
+
+    return res.json({ ok:true, status:r.status, account: JSON.parse(txt) });
+  } catch (e) {
+    return res.status(500).json({ ok:false, error: String(e).slice(0,400) });
+  }
+});
 const app = express();
 
 // ---- CORS (open; optionally lock later with an allowlist) ----
