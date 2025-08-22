@@ -33,7 +33,15 @@ app.post('/ai/generate', async (req, res) => {
       size,
       n: 1,
     });
+// --- add these two routes ---
+app.get('/', (req, res) => {
+  res.send('DreamCanvas backend is alive ✅');
+});
 
+app.get('/health', (req, res) => {
+  res.json({ ok: true, uptime: process.uptime() });
+});
+// --- end add ---
     const url = result.data[0].url;
     return res.json({ url });
   } catch (err) {
