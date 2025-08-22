@@ -14,7 +14,7 @@ const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 app.get('/health', (req, res) => res.json({ ok: true }));
 
 // only allow sizes you support
-const ALLOWED_SIZES = new Set(['1280x720', '1080x1920']);
+const ALLOWED_SIZES = new Set(['1024x1024', '1080x1920']);
 
 app.post('/ai/generate', async (req, res) => {
   try {
