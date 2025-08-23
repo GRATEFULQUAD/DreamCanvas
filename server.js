@@ -9,8 +9,7 @@ const cors = require('cors');
 const FormData = require('form-data');
 const fetch = (...args) => import('node-fetch').then(({ default: f }) => f(...args));
 
-// ---- CONFIG ----
-const PROVIDER = (process.env.PROVIDER || 'stability').toLowerCase();
+const PROVIDER = (process.env.PROVIDER || 'replicate').toLowerCase();
 
 const app = express();
 app.use(cors());
@@ -23,26 +22,26 @@ app.get('/', (_req, res) =>
 app.get('/health', (_req, res) =>
   res.json({ ok: true, provider: PROVIDER, time: new Date().toISOString() })
 );
-
-// ---- DEBUG ROUTES (no secrets leaked) ----
 app.get('/debug', (_req, res) => {
   const dbg = { ok: true, provider: PROVIDER, time: new Date().toISOString() };
-  if (PROVIDER === 'stability') {
-    dbg.hasKey = !!(process.env.STABILITY_API_KEY || '').trim();
-  } else if (PROVIDER === 'replicate') {
+  if (PROVIDER === 'replicate') {
     dbg.hasKey = !!(process.env.REPLICATE_API_TOKEN || '').trim();
-    dbg.model  = (process.env.REPLICATE_MODEL || 'black-forest-labs/flux-schnell');
+    dbg.model  = process.env.REPLICATE_MODEL || 'black-forest-labs/flux-schnell';
+  } else if (PROVIDER === 'stability') {
+    dbg.hasKey = !!(process.env.STABILITY_API_KEY || '').trim();
+  } else if (PROVIDER === 'modelslab') {
+    dbg.hasKey = !!(process.env.MODELSLAB_API_KEY || '').trim();
+    dbg.model  = process.env.MODELSLAB_MODEL || 'realistic-vision-v5.1';
   }
   res.json(dbg);
 });
 
-// Stability account check
+// Stability-only account check (optional)
 app.get('/whoami', async (_req, res) => {
   if (PROVIDER !== 'stability') return res.json({ ok:true, provider: PROVIDER, info:'whoami is for Stability only' });
   try {
     const KEY = (process.env.STABILITY_API_KEY || '').trim();
     if (!KEY) return res.status(500).json({ ok:false, error:'Missing STABILITY_API_KEY' });
-
     const r = await fetch('https://api.stability.ai/v1/user/account', {
       headers: { Authorization: `Bearer ${KEY}` }
     });
@@ -54,66 +53,15 @@ app.get('/whoami', async (_req, res) => {
   }
 });
 
-// Provider self-test
-app.get('/selftest', async (_req, res) => {
-  try {
-    if (PROVIDER === 'stability') {
-      const KEY = (process.env.STABILITY_API_KEY || '').trim();
-      if (!KEY) return res.status(500).json({ ok:false, error:'Missing STABILITY_API_KEY on server' });
-
-      const URL = 'https://api.stability.ai/v2beta/stable-image/generate/sd3';
-      const form = new FormData();
-      form.append('prompt', 'health check');
-      form.append('aspect_ratio', '1:1');
-      form.append('output_format', 'jpeg');
-
-      const r = await fetch(URL, {
-        method: 'POST',
-        headers: { Authorization: `Bearer ${KEY}`, Accept: 'image/*', ...form.getHeaders() },
-        body: form
-      });
-      if (!r.ok) {
-        const txt = await r.text().catch(() => '');
-        return res.status(r.status).json({ ok:false, status:r.status, msg:(txt || `Stability error ${r.status}`).slice(0,400) });
-      }
-      const buf = Buffer.from(await r.arrayBuffer());
-      return res.json({ ok:true, status:r.status, bytes: buf.length });
-    }
-
-    if (PROVIDER === 'replicate') {
-      const TOKEN = (process.env.REPLICATE_API_TOKEN || '').trim();
-      const MODEL = (process.env.REPLICATE_MODEL || 'black-forest-labs/flux-schnell').trim();
-      if (!TOKEN) return res.status(500).json({ ok:false, error:'Missing REPLICATE_API_TOKEN on server' });
-
-      const createUrl = `https://api.replicate.com/v1/models/${MODEL}/predictions`;
-      const start = await fetch(createUrl, {
-        method: 'POST',
-        headers: {
-          'Authorization': `Token ${TOKEN}`,
-          'Content-Type': 'application/json',
-          'Accept': 'application/json'
-        },
-        body: JSON.stringify({ input: { prompt: 'health check', aspect_ratio: '1:1' } })
-      });
-      const raw = await start.text();
-      return res.status(start.ok ? 200 : start.status).json({ ok:start.ok, status:start.status, body: raw.slice(0,400) });
-    }
-
-    return res.status(500).json({ ok:false, error:'Unknown PROVIDER' });
-  } catch (e) {
-    return res.status(500).json({ ok:false, error: String(e).slice(0,400) });
-  }
-});
-
-// ---- MAIN GENERATE ROUTE (multi-provider) ----
+// ---- MAIN GENERATE ROUTE ----
 let inFlight = 0;
 app.post('/ai/generate', async (req, res) => {
   if (inFlight >= 1) return res.status(429).json({ error: 'One at a time, please 🫶' });
   inFlight++;
 
   try {
-    let prompt = (req.body?.prompt || '').trim();
-    let aspect  = (req.body?.aspect || '1:1').toLowerCase();
+    let prompt = (req.body?.prompt || req.body?.description || req.body?.text || '').trim();
+    let aspect  = (req.body?.aspect || req.body?.size || '1:1').toLowerCase();
     if (!prompt) return res.status(400).json({ error: 'Missing prompt' });
     aspect = aspect.includes('16:9') ? '16:9' : aspect.includes('9:16') ? '9:16' : '1:1';
 
@@ -132,7 +80,12 @@ app.post('/ai/generate', async (req, res) => {
           'Content-Type': 'application/json',
           'Accept': 'application/json'
         },
-        body: JSON.stringify({ input: { prompt, aspect_ratio: aspect } })
+        body: JSON.stringify({
+          input: {
+            prompt,
+            aspect_ratio: aspect // "1:1" | "16:9" | "9:16" (flux-* models)
+          }
+        })
       });
 
       const startText = await start.text();
@@ -144,9 +97,7 @@ app.post('/ai/generate', async (req, res) => {
       const pollUrl = created?.urls?.get || created?.urls?.self;
       if (!pollUrl) return res.status(500).json({ error: 'Replicate did not return a poll URL' });
 
-      // poll until done
-      let status = created.status;
-      let output = created.output;
+      let status = created.status, output = created.output;
       const t0 = Date.now();
       while (status && !['succeeded', 'failed', 'canceled'].includes(status)) {
         await new Promise(r => setTimeout(r, POLL_MS));
@@ -164,13 +115,9 @@ app.post('/ai/generate', async (req, res) => {
         if (Date.now() - t0 > 90_000) return res.status(504).json({ error: 'Replicate timeout' });
       }
 
-      if (status !== 'succeeded') {
-        return res.status(500).json({ error: `Replicate ${status || 'failed'}` });
-      }
-
+      if (status !== 'succeeded') return res.status(500).json({ error: `Replicate ${status || 'failed'}` });
       let url = Array.isArray(output) ? output[0] : (output?.[0] || output?.image || output?.url);
       if (!url) return res.status(500).json({ error: 'Replicate returned no image URL' });
-
       return res.json({ imageUrl: url, aspect });
     }
 
@@ -191,18 +138,54 @@ app.post('/ai/generate', async (req, res) => {
         body: form
       });
 
+      const textMaybe = await resp.text().catch(()=>'');
       if (!resp.ok) {
-        const text = await resp.text().catch(() => '');
-        console.error('[Stability FAIL]', resp.status, text.slice(0,300));
-        return res.status(resp.status).json({ error: text || `Stability error ${resp.status}` });
+        console.error('[Stability FAIL]', resp.status, textMaybe.slice(0,300));
+        return res.status(resp.status).json({ error: textMaybe || `Stability error ${resp.status}` });
       }
-
-      const buf = Buffer.from(await resp.arrayBuffer());
-      const b64 = buf.toString('base64');
+      // convert the text back to bytes if necessary
+      const buf = Buffer.from(textMaybe || await resp.arrayBuffer());
+      const isBinary = !textMaybe || !/^{/.test(textMaybe);
+      const dataBuf = isBinary ? buf : Buffer.from(await (await fetch(URL)).arrayBuffer()); // fallback
+      const b64 = (isBinary ? dataBuf : buf).toString('base64');
       return res.json({ imageUrl: `data:image/jpeg;base64,${b64}`, aspect });
     }
 
-    return res.status(500).json({ error: 'Unknown PROVIDER. Use PROVIDER=replicate or stability.' });
+    // ---------- MODELSLAB ----------
+    if (PROVIDER === 'modelslab') {
+      const KEY = (process.env.MODELSLAB_API_KEY || '').trim();
+      const MODEL = (process.env.MODELSLAB_MODEL || 'realistic-vision-v5.1').trim();
+      if (!KEY) return res.status(500).json({ error: 'Missing MODELSLAB_API_KEY on server' });
+
+      const resp = await fetch('https://modelslab.com/api/v1/image', {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${KEY}`,
+          'Content-Type': 'application/json',
+          'Accept': 'application/json'
+        },
+        body: JSON.stringify({
+          model_id: MODEL,
+          prompt,
+          width: aspect === '16:9' ? 1280 : aspect === '9:16' ? 720 : 1024,
+          height: aspect === '9:16' ? 1280 : aspect === '16:9' ? 720 : 1024,
+          samples: 1
+        })
+      });
+
+      const txt = await resp.text();
+      if (!resp.ok) {
+        console.error('[ModelsLab FAIL]', resp.status, txt.slice(0,300));
+        return res.status(resp.status).json({ error: txt || `ModelsLab error ${resp.status}` });
+      }
+
+      const data = JSON.parse(txt);
+      const url = data?.output?.[0];
+      if (!url) return res.status(500).json({ error: 'ModelsLab returned no image URL' });
+      return res.json({ imageUrl: url, aspect });
+    }
+
+    return res.status(500).json({ error: 'Unknown PROVIDER. Use replicate, stability, or modelslab.' });
 
   } catch (err) {
     console.error('Generation error:', err);
