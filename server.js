@@ -1,202 +1,173 @@
-// server.js — DreamCanvas backend (ModelsLab)
-// -------------------------------------------
-
+// server.js  — DreamCanvas (ModelsLab) + History (last 10)
 require("dotenv").config();
+
 const express = require("express");
 const cors = require("cors");
 
-// Node 18+ has global fetch. If not available, uncomment this:
-// const fetch = (...args) => import('node-fetch').then(({ default: f }) => f(...args));
-
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: "2mb" }));
+app.use(express.json({ limit: "1mb" }));
 
-// ---------- Config (env + sane defaults) ----------
+// ------------------- ENV -------------------
 const PORT = process.env.PORT || 10000;
-
 const PROVIDER = (process.env.PROVIDER || "modelslab").toLowerCase();
-const MODELSLAB_BASE = process.env.MODELSLAB_BASE || "https://modelslab.com";
+
+// ModelsLab config
 const MODELSLAB_API_KEY = process.env.MODELSLAB_API_KEY || "";
-const MODEL = process.env.MODELSLAB_MODEL || "realistic-vision-v5.1";
+// ModelsLab’s image endpoint. (We keep it overrideable via env just in case.)
+const MODELSLAB_URL =
+  process.env.MODELSLAB_URL || "https://modelslab.com/api/v1/image";
 
-// Free tier per-user limit (by day), soft block
-const FREE_PER_USER = parseInt(process.env.FREE_PER_USER || "2", 10);
-const CASHTAG = (process.env.CASHTAG || "").replace(/^\$/, "");
+// default model (you can override via env MODEL_NAME)
+const MODEL_NAME = process.env.MODEL_NAME || "realistic-vision-v5.1";
 
-// ---------- Tiny in-memory quota (resets when dyno restarts) ----------
-const counters = new Map(); // key -> { count, day }
+// ------------------- HISTORY (rolling last 10) -------------------
+const history = []; // [{ url, time }]
+function pushHistory(url) {
+  if (!url) return;
+  history.unshift({ url, time: new Date().toISOString() });
+  if (history.length > 10) history.pop();
+}
+app.get("/ai/history", (req, res) => {
+  res.json({ history });
+});
 
-function userKey(req) {
-  // Prefer an app user id if you send one; fallback to IP
-  const uid =
-    req.headers["x-user-id"] ||
-    req.headers["x-base44-userid"] ||
-    req.headers["x-client-id"] ||
-    "";
-  const ip =
-    (req.headers["x-forwarded-for"] || "")
-      .split(",")[0]
-      .trim() ||
-    req.ip ||
-    "unknown";
-  return uid || ip;
+// ------------------- HELPERS -------------------
+function sizeFromAspect(aspect = "16:9") {
+  // simple HD pair; adjust if you change your buttons
+  if (aspect === "9:16") return { width: 720, height: 1280 };
+  return { width: 1280, height: 720 };
 }
 
-function checkQuota(req) {
-  const key = userKey(req);
-  const today = new Date().toISOString().slice(0, 10);
-  let row = counters.get(key);
-  if (!row || row.day !== today) row = { count: 0, day: today };
-  if (row.count >= FREE_PER_USER) {
-    return { ok: false, key, row };
+function pickUrl(obj) {
+  // Try several common response shapes to find a URL
+  if (!obj || typeof obj !== "object") return null;
+
+  if (typeof obj.image === "string") return obj.image;
+  if (typeof obj.url === "string") return obj.url;
+
+  if (Array.isArray(obj.output) && obj.output[0]) {
+    if (typeof obj.output[0] === "string") return obj.output[0];
+    if (typeof obj.output[0].url === "string") return obj.output[0].url;
   }
-  counters.set(key, row); // store baseline
-  return { ok: true, key, row };
-}
-
-function bumpQuota(key) {
-  const today = new Date().toISOString().slice(0, 10);
-  const row = counters.get(key) || { count: 0, day: today };
-  if (row.day !== today) {
-    row.count = 0;
-    row.day = today;
+  if (Array.isArray(obj.data) && obj.data[0]) {
+    if (typeof obj.data[0] === "string") return obj.data[0];
+    if (typeof obj.data[0].url === "string") return obj.data[0].url;
   }
-  row.count += 1;
-  counters.set(key, row);
-  return row.count;
-}
-
-// ---------- Helpers ----------
-function pickSize(aspect = "16:9") {
-  const a = String(aspect).trim();
-  if (a === "9:16" || a === "portrait") {
-    return { width: 1080, height: 1920, aspect: "9:16" };
-  }
-  // default landscape
-  return { width: 1920, height: 1080, aspect: "16:9" };
-}
-
-function extractUrl(payload) {
-  // ModelsLab has returned URLs in a few shapes across plans. Try them all.
-  if (!payload) return null;
-
-  // Common patterns
-  if (typeof payload === "string" && /^https?:\/\//i.test(payload)) return payload;
-
-  if (payload.imageUrl && /^https?:\/\//i.test(payload.imageUrl)) return payload.imageUrl;
-  if (payload.url && /^https?:\/\//i.test(payload.url)) return payload.url;
-
-  // Some responses: { output: ["https://..."] } or { images:["..."] }
-  if (Array.isArray(payload.output) && payload.output[0]) return payload.output[0];
-  if (Array.isArray(payload.images) && payload.images[0]) return payload.images[0];
-
-  // Nested
-  if (payload.data && Array.isArray(payload.data) && payload.data[0]) {
-    const first = payload.data[0];
-    if (typeof first === "string" && /^https?:\/\//i.test(first)) return first;
-    if (first && first.url && /^https?:\/\//i.test(first.url)) return first.url;
-  }
+  if (obj.result && typeof obj.result === "string") return obj.result;
 
   return null;
 }
 
-// ---------- Health ----------
+// ------------------- HEALTH / WHOAMI -------------------
 app.get("/health", (req, res) => {
   res.json({
     ok: true,
     provider: PROVIDER,
+    hasKey: Boolean(MODELSLAB_API_KEY),
+    model: MODEL_NAME,
     time: new Date().toISOString(),
-    hasKey: !!MODELSLAB_API_KEY,
-    model: MODEL,
   });
 });
 
-// Friendly root
-app.get("/", (req, res) => {
-  res.type("text").send(
-    "DreamCanvas server is up. Try GET /health or POST /ai/generate"
-  );
+// Simple “whoami” stub (ModelsLab doesn’t expose an account whoami)
+app.get("/whoami", (req, res) => {
+  res.json({
+    ok: true,
+    provider: PROVIDER,
+    msg: "ModelsLab whoami not available; key presence only",
+    hasKey: Boolean(MODELSLAB_API_KEY),
+    time: new Date().toISOString(),
+  });
 });
 
-// ---------- MAIN: Generate ----------
+// ------------------- GENERATE -------------------
 app.post("/ai/generate", async (req, res) => {
   try {
-    // Soft free limit
-    const gate = checkQuota(req);
-    if (!gate.ok) {
-      return res.status(429).json({
-        error: `Free limit reached (${FREE_PER_USER}/day). Please come back tomorrow.`,
-        donate: CASHTAG ? `https://cash.app/$${CASHTAG}` : undefined,
-      });
+    if (PROVIDER !== "modelslab") {
+      return res.status(400).json({ error: "PROVIDER must be 'modelslab'" });
+    }
+    if (!MODELSLAB_API_KEY) {
+      return res.status(401).json({ error: "Missing MODELSLAB_API_KEY" });
     }
 
     const prompt = (req.body?.prompt || "").trim();
     const aspect = (req.body?.aspect || "16:9").trim();
 
     if (!prompt) {
-      return res.status(400).json({ error: "Missing prompt" });
-    }
-    if (!MODELSLAB_API_KEY) {
-      return res.status(500).json({ error: "MODELSLAB_API_KEY missing" });
+      return res.status(400).json({ error: "Please provide a prompt." });
     }
 
-    const { width, height } = pickSize(aspect);
+    const { width, height } = sizeFromAspect(aspect);
 
-    // ModelsLab Text-to-Image (JSON). Endpoint differs by plan; this one matches
-    // what worked for you previously (and we handle shape flexibly on parse).
-    const url = `${MODELSLAB_BASE.replace(/\/+$/,"")}/api/v1/image`;
-    const body = {
+    // ModelsLab expects JSON. Typical fields:
+    // key, prompt, width, height, model_id (or model)
+    const payload = {
       key: MODELSLAB_API_KEY,
       prompt,
       width,
       height,
-      // tuned for wallpapers & cost control
-      samples: 1,
-      steps: 30,
-      guidance_scale: 7,
-      safety_checker: false,
-      enhance_prompt: true,
-      // if your plan supports it:
-      lora_strength: 0,
-      negative_prompt:
-        "low quality, blurry, distorted, deformed, extra limbs, text, watermark",
-      output_format: "jpg",
-      model_id: MODEL, // many ModelsLab endpoints accept model_id
+      model_id: MODEL_NAME, // leave as-is; some accounts expect `model_id`
+      // If your account needs "model" instead, uncomment the next line:
+      // model: MODEL_NAME,
+      // Extra hints (optional):
+      // samples: 1,
+      // safety_checker: false,
+      // enhance_prompt: true,
     };
 
-    const resp = await fetch(url, {
+    const resp = await fetch(MODELSLAB_URL, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "application/json",
+      },
+      body: JSON.stringify(payload),
     });
 
-    const preview = await resp.text(); // for debugging odd shapes
+    const txt = await resp.text();
     let data = {};
-    try { data = JSON.parse(preview); } catch (_) {}
+    try {
+      data = JSON.parse(txt);
+    } catch (_) {
+      // not JSON
+    }
 
     if (!resp.ok) {
-      // Some error shapes: { status:'error', message:'...' }
-      const msg = data?.message || data?.error || preview || `HTTP ${resp.status}`;
-      return res.status(502).json({ error: msg, rawPreview: preview });
-    }
-
-    const imageUrl = extractUrl(data) || extractUrl(data?.data);
-    if (!imageUrl) {
+      // Surface provider error message if present
+      const providerMsg =
+        (data && (data.message || data.error)) || txt || "request failed";
       return res
-        .status(502)
-        .json({ error: "ModelsLab returned no image URL", rawPreview: preview });
+        .status(resp.status)
+        .json({ error: `ModelsLab ${resp.status}: ${providerMsg}` });
     }
 
-    bumpQuota(gate.key);
+    const imageUrl = pickUrl(data);
+    if (!imageUrl) {
+      return res.status(500).json({
+        error: "ModelsLab returned no image URL",
+        rawPreview: txt?.slice(0, 500),
+      });
+    }
+
+    // Add to rolling history
+    pushHistory(imageUrl);
+
     return res.json({ imageUrl, aspect });
   } catch (err) {
-    console.error("[/ai/generate] error:", err);
+    console.error("Generate error:", err);
     return res.status(500).json({ error: err.message || "Server error" });
   }
 });
 
-// ---------- Start ----------
+// ------------------- ROOT -------------------
+app.get("/", (req, res) => {
+  res.send(
+    `<pre>DreamCanvas server (ModelsLab)\n\nEndpoints:\n  GET  /health\n  GET  /whoami\n  GET  /ai/history\n  POST /ai/generate  { prompt, aspect: "16:9" | "9:16" }\n</pre>`
+  );
+});
+
+// ------------------- START -------------------
 app.listen(PORT, () => {
   console.log(`[Boot] DreamCanvas (ModelsLab) running on port ${PORT}`);
 });
