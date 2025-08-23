@@ -65,7 +65,20 @@ function pushHistory(url) {
 app.get("/ai/history", (req, res) => {
   res.json({ history });
 });
+// ----------- SUPPORT / DONATION MESSAGE (PayPal only) ------------
+const DONATION_MESSAGE =
+  "You do NOT need to — but if you’d like to help with costs (plus I’ll be your best friend 💜), you can donate to my Picture Fund. It is in no way required to get pictures — it’s just my way of saying YOU ARE AWESOME.";
 
+app.get("/support", (req, res) => {
+  const paypal = (process.env.PAYPAL_USERNAME || "").trim();
+  const paypalBase = paypal ? `https://paypal.me/${encodeURIComponent(paypal)}` : null;
+
+  res.json({
+    ok: true,
+    message: DONATION_MESSAGE,
+    paypal: paypalBase ? { username: paypal, web: paypalBase } : null
+  });
+});
 // ------------------- SUPPORT / DONATION MESSAGE -------------------
 const DONATE_AMOUNTS = [2, 3, 5];
 const DONATION_MESSAGE =
