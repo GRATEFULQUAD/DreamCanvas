@@ -9,7 +9,9 @@ const cors = require('cors');
 const FormData = require('form-data');
 const fetch = (...args) => import('node-fetch').then(({ default: f }) => f(...args));
 
-const PROVIDER = (process.env.PROVIDER || 'replicate').toLowerCase();
+// ---- CONFIG ----
+// Default to modelslab so you never have to think about it
+const PROVIDER = (process.env.PROVIDER || 'modelslab').toLowerCase();
 
 const app = express();
 app.use(cors());
@@ -17,11 +19,16 @@ app.use(express.json({ limit: '2mb' }));
 
 // ---- BASIC ROUTES ----
 app.get('/', (_req, res) =>
-  res.type('text').send(`DreamCanvas API is up. Provider=${PROVIDER}. Try GET /health or POST /ai/generate.`)
+  res
+    .type('text')
+    .send(`DreamCanvas API is up. Provider=${PROVIDER}. Try GET /health or POST /ai/generate.`)
 );
+
 app.get('/health', (_req, res) =>
   res.json({ ok: true, provider: PROVIDER, time: new Date().toISOString() })
 );
+
+// ---- DEBUG (no secrets) ----
 app.get('/debug', (_req, res) => {
   const dbg = { ok: true, provider: PROVIDER, time: new Date().toISOString() };
   if (PROVIDER === 'replicate') {
@@ -36,18 +43,88 @@ app.get('/debug', (_req, res) => {
   res.json(dbg);
 });
 
-// Stability-only account check (optional)
+// ---- Stability-only account check (optional) ----
 app.get('/whoami', async (_req, res) => {
-  if (PROVIDER !== 'stability') return res.json({ ok:true, provider: PROVIDER, info:'whoami is for Stability only' });
+  if (PROVIDER !== 'stability') {
+    return res.json({ ok: true, provider: PROVIDER, info: 'whoami is for Stability only' });
+  }
   try {
     const KEY = (process.env.STABILITY_API_KEY || '').trim();
     if (!KEY) return res.status(500).json({ ok:false, error:'Missing STABILITY_API_KEY' });
+
     const r = await fetch('https://api.stability.ai/v1/user/account', {
       headers: { Authorization: `Bearer ${KEY}` }
     });
     const txt = await r.text().catch(()=> '');
     if (!r.ok) return res.status(r.status).json({ ok:false, status:r.status, msg: txt.slice(0,400) });
     return res.json({ ok:true, status:r.status, account: JSON.parse(txt) });
+  } catch (e) {
+    return res.status(500).json({ ok:false, error: String(e).slice(0,400) });
+  }
+});
+
+// ---- Provider self-test (hits current provider) ----
+app.get('/selftest', async (_req, res) => {
+  try {
+    if (PROVIDER === 'stability') {
+      const KEY = (process.env.STABILITY_API_KEY || '').trim();
+      if (!KEY) return res.status(500).json({ ok:false, error:'Missing STABILITY_API_KEY on server' });
+
+      const URL = 'https://api.stability.ai/v2beta/stable-image/generate/sd3';
+      const form = new FormData();
+      form.append('prompt', 'health check');
+      form.append('aspect_ratio', '1:1');
+      form.append('output_format', 'jpeg');
+
+      const r = await fetch(URL, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${KEY}`, Accept: 'image/*', ...form.getHeaders() },
+        body: form
+      });
+      const ok = r.ok;
+      const body = ok ? `${(await r.arrayBuffer()).byteLength} bytes` : (await r.text().catch(()=> '')).slice(0,400);
+      return res.status(ok ? 200 : r.status).json({ ok, status: r.status, body });
+    }
+
+    if (PROVIDER === 'replicate') {
+      const TOKEN = (process.env.REPLICATE_API_TOKEN || '').trim();
+      const MODEL = (process.env.REPLICATE_MODEL || 'black-forest-labs/flux-schnell').trim();
+      if (!TOKEN) return res.status(500).json({ ok:false, error:'Missing REPLICATE_API_TOKEN on server' });
+
+      const createUrl = `https://api.replicate.com/v1/models/${MODEL}/predictions`;
+      const start = await fetch(createUrl, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Token ${TOKEN}`,
+          'Content-Type': 'application/json',
+          'Accept': 'application/json'
+        },
+        body: JSON.stringify({ input: { prompt: 'health check', aspect_ratio: '1:1' } })
+      });
+      const raw = await start.text();
+      return res.status(start.ok ? 200 : start.status).json({ ok: start.ok, status: start.status, body: raw.slice(0,400) });
+    }
+
+    if (PROVIDER === 'modelslab') {
+      const KEY = (process.env.MODELSLAB_API_KEY || '').trim();
+      const MODEL = (process.env.MODELSLAB_MODEL || 'realistic-vision-v5.1').trim();
+      if (!KEY) return res.status(500).json({ ok:false, error:'Missing MODELSLAB_API_KEY on server' });
+
+      const width = 1280, height = 720; // 16:9 smoke test
+      const r = await fetch('https://modelslab.com/api/v1/image', {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${KEY}`,
+          'Content-Type': 'application/json',
+          'Accept': 'application/json'
+        },
+        body: JSON.stringify({ model_id: MODEL, prompt: 'health check', width, height, samples: 1 })
+      });
+      const txt = await r.text();
+      return res.status(r.ok ? 200 : r.status).json({ ok: r.ok, status: r.status, body: txt.slice(0,400) });
+    }
+
+    return res.status(500).json({ ok:false, error:'Unknown PROVIDER' });
   } catch (e) {
     return res.status(500).json({ ok:false, error: String(e).slice(0,400) });
   }
@@ -80,12 +157,7 @@ app.post('/ai/generate', async (req, res) => {
           'Content-Type': 'application/json',
           'Accept': 'application/json'
         },
-        body: JSON.stringify({
-          input: {
-            prompt,
-            aspect_ratio: aspect // "1:1" | "16:9" | "9:16" (flux-* models)
-          }
-        })
+        body: JSON.stringify({ input: { prompt, aspect_ratio: aspect } })
       });
 
       const startText = await start.text();
@@ -138,16 +210,13 @@ app.post('/ai/generate', async (req, res) => {
         body: form
       });
 
-      const textMaybe = await resp.text().catch(()=>'');
       if (!resp.ok) {
-        console.error('[Stability FAIL]', resp.status, textMaybe.slice(0,300));
-        return res.status(resp.status).json({ error: textMaybe || `Stability error ${resp.status}` });
+        const text = await resp.text().catch(() => '');
+        console.error('[Stability FAIL]', resp.status, text.slice(0,300));
+        return res.status(resp.status).json({ error: text || `Stability error ${resp.status}` });
       }
-      // convert the text back to bytes if necessary
-      const buf = Buffer.from(textMaybe || await resp.arrayBuffer());
-      const isBinary = !textMaybe || !/^{/.test(textMaybe);
-      const dataBuf = isBinary ? buf : Buffer.from(await (await fetch(URL)).arrayBuffer()); // fallback
-      const b64 = (isBinary ? dataBuf : buf).toString('base64');
+      const buf = Buffer.from(await resp.arrayBuffer());
+      const b64 = buf.toString('base64');
       return res.json({ imageUrl: `data:image/jpeg;base64,${b64}`, aspect });
     }
 
@@ -156,6 +225,9 @@ app.post('/ai/generate', async (req, res) => {
       const KEY = (process.env.MODELSLAB_API_KEY || '').trim();
       const MODEL = (process.env.MODELSLAB_MODEL || 'realistic-vision-v5.1').trim();
       if (!KEY) return res.status(500).json({ error: 'Missing MODELSLAB_API_KEY on server' });
+
+      const width  = aspect === '16:9' ? 1280 : aspect === '9:16' ? 720 : 1024;
+      const height = aspect === '9:16' ? 1280 : aspect === '16:9' ? 720 : 1024;
 
       const resp = await fetch('https://modelslab.com/api/v1/image', {
         method: 'POST',
@@ -167,8 +239,7 @@ app.post('/ai/generate', async (req, res) => {
         body: JSON.stringify({
           model_id: MODEL,
           prompt,
-          width: aspect === '16:9' ? 1280 : aspect === '9:16' ? 720 : 1024,
-          height: aspect === '9:16' ? 1280 : aspect === '16:9' ? 720 : 1024,
+          width, height,
           samples: 1
         })
       });
@@ -179,12 +250,39 @@ app.post('/ai/generate', async (req, res) => {
         return res.status(resp.status).json({ error: txt || `ModelsLab error ${resp.status}` });
       }
 
-      const data = JSON.parse(txt);
-      const url = data?.output?.[0];
-      if (!url) return res.status(500).json({ error: 'ModelsLab returned no image URL' });
+      // Robust parsing for different Modelslab response shapes
+      let data;
+      try { data = JSON.parse(txt); } catch { data = {}; }
+
+      // Common possibilities:
+      // 1) { output: ["https://..."] }
+      // 2) { data: [{ url: "https://..." }] }
+      // 3) { url: "https://..." }
+      // 4) { images: ["data:image/jpeg;base64,..."] } or { image_base64: "..." }
+      let url =
+        data?.output?.[0] ||
+        data?.data?.[0]?.url ||
+        data?.url ||
+        null;
+
+      if (!url) {
+        const b64 =
+          (Array.isArray(data?.images) && typeof data.images[0] === 'string' && data.images[0].startsWith('data:image'))
+            ? data.images[0].split(',')[1] // strip data URL prefix
+            : (data?.image_base64 || null);
+
+        if (b64) url = `data:image/jpeg;base64,${b64}`;
+      }
+
+      if (!url) {
+        console.error('[ModelsLab PARSE] raw:', txt.slice(0, 400));
+        return res.status(500).json({ error: 'ModelsLab returned no image URL', rawPreview: txt.slice(0,200) });
+      }
+
       return res.json({ imageUrl: url, aspect });
     }
 
+    // ---------- fallback ----------
     return res.status(500).json({ error: 'Unknown PROVIDER. Use replicate, stability, or modelslab.' });
 
   } catch (err) {
