@@ -1,4 +1,4 @@
-// server.js — DreamCanvas (ModelsLab) + History + Free Limit + PayPal Donate
+// server.js — DreamCanvas (ModelsLab) + History + Free Limit + PayPal (forced URL)
 require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
@@ -22,11 +22,11 @@ if (!MODELSLAB_URL || MODELSLAB_URL.includes("<") || !/^https?:\/\//.test(MODELS
 
 const FREE_PER_USER = parseInt(process.env.FREE_PER_USER || "2", 10);
 
-// PayPal (donations)
+// PayPal (forced single URL)
 const PAYPAL_USERNAME = (process.env.PAYPAL_USERNAME || "").trim();
-const PAYPAL_BASE = PAYPAL_USERNAME ? `https://paypal.me/${encodeURIComponent(PAYPAL_USERNAME)}` : null;
-// Preset amounts to show as quick buttons
-const PAYPAL_AMOUNTS = [2, 5, 10];
+const PAYPAL_FULL_URL = (process.env.PAYPAL_FULL_URL || "").trim();
+const PAYPAL_BASE = PAYPAL_FULL_URL ||
+  (PAYPAL_USERNAME ? `https://paypal.me/${encodeURIComponent(PAYPAL_USERNAME)}` : "");
 
 // ------------------- SIMPLE QUOTA (soft, per day, in-memory) -------------------
 const counters = new Map(); // key -> { count, day }
@@ -74,29 +74,16 @@ app.get("/ai/history", (req, res) => {
   res.json({ history });
 });
 
-// ------------------- SUPPORT / DONATION MESSAGE (PayPal only) -------------------
+// ------------------- SUPPORT / DONATION (PayPal forced URL) -------------------
 const DONATION_MESSAGE =
   "You do NOT need to — but if you’d like to help with costs (plus I’ll be your best friend 💜), you can donate to my Picture Fund. It is in no way required to get pictures — it’s just my way of saying YOU ARE AWESOME.";
 
 app.get("/support", (req, res) => {
-  if (!PAYPAL_BASE) {
-    return res.json({
-      ok: true,
-      message: DONATION_MESSAGE,
-      paypal: null
-    });
-  }
-  // PayPal lets amount be appended like /5 /10 etc. (USD default for many locales)
-  const quick = PAYPAL_AMOUNTS.map((amt) => `${PAYPAL_BASE}/${amt}`);
+  const web = PAYPAL_BASE && PAYPAL_BASE.startsWith("http") ? PAYPAL_BASE : null;
   res.json({
     ok: true,
     message: DONATION_MESSAGE,
-    paypal: {
-      username: PAYPAL_USERNAME,
-      web: PAYPAL_BASE,
-      amounts: PAYPAL_AMOUNTS,
-      links: quick
-    }
+    paypal: web ? { web, amounts: [], links: [] } : null
   });
 });
 
@@ -133,7 +120,7 @@ app.get("/health", (req, res) => {
     hasKey: Boolean(MODELSLAB_API_KEY),
     model: MODEL_NAME,
     donate: PAYPAL_BASE || null,
-    amounts: PAYPAL_BASE ? PAYPAL_AMOUNTS : [],
+    freePerDay: FREE_PER_USER,
     time: new Date().toISOString(),
   });
 });
@@ -143,9 +130,9 @@ app.get("/", (req, res) => {
 Provider: ${PROVIDER}
 Endpoints:
   GET  /health
-  GET  /support         (PayPal message + links)
+  GET  /support          (PayPal message + single forced URL)
   GET  /ai/history
-  POST /ai/generate     { prompt, aspect: "16:9" | "9:16" }
+  POST /ai/generate      { prompt, aspect: "16:9" | "9:16" }
 </pre>`
   );
 });
@@ -179,11 +166,10 @@ app.post("/ai/generate", async (req, res) => {
       height,
       model_id: MODEL_NAME,     // some accounts accept "model" instead
       output_format: "jpg",
-      // Optional tunings you can uncomment/tweak:
-      // steps: 30,
+      // Optional tunings:
+      // steps: 28,
       // guidance_scale: 7,
       // enhance_prompt: true,
-      // safety_checker: false,
       // samples: 1,
     };
 
@@ -195,7 +181,7 @@ app.post("/ai/generate", async (req, res) => {
 
     const txt = await resp.text();
     let data = {};
-    try { data = JSON.parse(txt); } catch { /* keep raw txt for preview */ }
+    try { data = JSON.parse(txt); } catch {}
 
     if (!resp.ok) {
       const msg = data?.message || data?.error || txt || `HTTP ${resp.status}`;
