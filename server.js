@@ -1,131 +1,202 @@
-// ----- Boot & crash logging -----
-process.on('uncaughtException', e => { console.error('UNCAUGHT', e); process.exit(1); });
-process.on('unhandledRejection', e => { console.error('UNHANDLED', e); process.exit(1); });
-console.log('[Boot] DreamCanvas (Modelslab-only) starting…');
+// server.js — DreamCanvas backend (ModelsLab)
+// -------------------------------------------
 
-require('dotenv').config();
-const express = require('express');
-const cors = require('cors');
-const fetch = (...args) => import('node-fetch').then(({ default: f }) => f(...args));
+require("dotenv").config();
+const express = require("express");
+const cors = require("cors");
+
+// Node 18+ has global fetch. If not available, uncomment this:
+// const fetch = (...args) => import('node-fetch').then(({ default: f }) => f(...args));
 
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: '2mb' }));
+app.use(express.json({ limit: "2mb" }));
 
-// ---- BASIC ROUTES ----
-app.get('/', (_req, res) =>
-  res.type('text').send('DreamCanvas API is up (provider=modelslab). Try GET /health or POST /ai/generate.')
-);
+// ---------- Config (env + sane defaults) ----------
+const PORT = process.env.PORT || 10000;
 
-app.get('/health', (_req, res) =>
-  res.json({ ok: true, provider: 'modelslab', time: new Date().toISOString() })
-);
+const PROVIDER = (process.env.PROVIDER || "modelslab").toLowerCase();
+const MODELSLAB_BASE = process.env.MODELSLAB_BASE || "https://modelslab.com";
+const MODELSLAB_API_KEY = process.env.MODELSLAB_API_KEY || "";
+const MODEL = process.env.MODELSLAB_MODEL || "realistic-vision-v5.1";
 
-app.get('/debug', (_req, res) => {
+// Free tier per-user limit (by day), soft block
+const FREE_PER_USER = parseInt(process.env.FREE_PER_USER || "2", 10);
+const CASHTAG = (process.env.CASHTAG || "").replace(/^\$/, "");
+
+// ---------- Tiny in-memory quota (resets when dyno restarts) ----------
+const counters = new Map(); // key -> { count, day }
+
+function userKey(req) {
+  // Prefer an app user id if you send one; fallback to IP
+  const uid =
+    req.headers["x-user-id"] ||
+    req.headers["x-base44-userid"] ||
+    req.headers["x-client-id"] ||
+    "";
+  const ip =
+    (req.headers["x-forwarded-for"] || "")
+      .split(",")[0]
+      .trim() ||
+    req.ip ||
+    "unknown";
+  return uid || ip;
+}
+
+function checkQuota(req) {
+  const key = userKey(req);
+  const today = new Date().toISOString().slice(0, 10);
+  let row = counters.get(key);
+  if (!row || row.day !== today) row = { count: 0, day: today };
+  if (row.count >= FREE_PER_USER) {
+    return { ok: false, key, row };
+  }
+  counters.set(key, row); // store baseline
+  return { ok: true, key, row };
+}
+
+function bumpQuota(key) {
+  const today = new Date().toISOString().slice(0, 10);
+  const row = counters.get(key) || { count: 0, day: today };
+  if (row.day !== today) {
+    row.count = 0;
+    row.day = today;
+  }
+  row.count += 1;
+  counters.set(key, row);
+  return row.count;
+}
+
+// ---------- Helpers ----------
+function pickSize(aspect = "16:9") {
+  const a = String(aspect).trim();
+  if (a === "9:16" || a === "portrait") {
+    return { width: 1080, height: 1920, aspect: "9:16" };
+  }
+  // default landscape
+  return { width: 1920, height: 1080, aspect: "16:9" };
+}
+
+function extractUrl(payload) {
+  // ModelsLab has returned URLs in a few shapes across plans. Try them all.
+  if (!payload) return null;
+
+  // Common patterns
+  if (typeof payload === "string" && /^https?:\/\//i.test(payload)) return payload;
+
+  if (payload.imageUrl && /^https?:\/\//i.test(payload.imageUrl)) return payload.imageUrl;
+  if (payload.url && /^https?:\/\//i.test(payload.url)) return payload.url;
+
+  // Some responses: { output: ["https://..."] } or { images:["..."] }
+  if (Array.isArray(payload.output) && payload.output[0]) return payload.output[0];
+  if (Array.isArray(payload.images) && payload.images[0]) return payload.images[0];
+
+  // Nested
+  if (payload.data && Array.isArray(payload.data) && payload.data[0]) {
+    const first = payload.data[0];
+    if (typeof first === "string" && /^https?:\/\//i.test(first)) return first;
+    if (first && first.url && /^https?:\/\//i.test(first.url)) return first.url;
+  }
+
+  return null;
+}
+
+// ---------- Health ----------
+app.get("/health", (req, res) => {
   res.json({
     ok: true,
-    provider: 'modelslab',
-    hasKey: !!(process.env.MODELSLAB_API_KEY || '').trim(),
-    model: process.env.MODELSLAB_MODEL || 'realistic-vision-v5.1',
-    time: new Date().toISOString()
+    provider: PROVIDER,
+    time: new Date().toISOString(),
+    hasKey: !!MODELSLAB_API_KEY,
+    model: MODEL,
   });
 });
 
-// ---- Self-test (hits Modelslab using your key) ----
-app.get('/selftest', async (_req, res) => {
-  try {
-    const KEY = (process.env.MODELSLAB_API_KEY || '').trim();
-    const MODEL = (process.env.MODELSLAB_MODEL || 'realistic-vision-v5.1').trim();
-    if (!KEY) return res.status(500).json({ ok:false, error:'Missing MODELSLAB_API_KEY' });
-
-    const r = await fetch('https://modelslab.com/api/v6/realtime/text2img', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
-      body: JSON.stringify({
-        key: KEY,
-        prompt: 'health check',
-        model_id: MODEL,
-        width: 1024,
-        height: 1024,
-        samples: 1
-      })
-    });
-    const txt = await r.text();
-    return res.status(r.ok ? 200 : r.status).json({ ok: r.ok, status: r.status, body: txt.slice(0, 400) });
-  } catch (e) {
-    return res.status(500).json({ ok:false, error: String(e).slice(0,400) });
-  }
+// Friendly root
+app.get("/", (req, res) => {
+  res.type("text").send(
+    "DreamCanvas server is up. Try GET /health or POST /ai/generate"
+  );
 });
 
-// ---- MAIN GENERATE ROUTE (Modelslab only) ----
-let inFlight = 0;
-app.post('/ai/generate', async (req, res) => {
-  if (inFlight >= 1) return res.status(429).json({ error: 'One at a time, please 🫶' });
-  inFlight++;
-
+// ---------- MAIN: Generate ----------
+app.post("/ai/generate", async (req, res) => {
   try {
-    const KEY = (process.env.MODELSLAB_API_KEY || '').trim();
-    const MODEL = (process.env.MODELSLAB_MODEL || 'realistic-vision-v5.1').trim();
-    if (!KEY) return res.status(500).json({ error: 'Missing MODELSLAB_API_KEY on server' });
+    // Soft free limit
+    const gate = checkQuota(req);
+    if (!gate.ok) {
+      return res.status(429).json({
+        error: `Free limit reached (${FREE_PER_USER}/day). Please come back tomorrow.`,
+        donate: CASHTAG ? `https://cash.app/$${CASHTAG}` : undefined,
+      });
+    }
 
-    let prompt = (req.body?.prompt || req.body?.description || req.body?.text || '').trim();
-    if (!prompt) return res.status(400).json({ error: 'Missing prompt' });
-    let aspect = (req.body?.aspect || '1:1').toLowerCase();
+    const prompt = (req.body?.prompt || "").trim();
+    const aspect = (req.body?.aspect || "16:9").trim();
 
-    // Use sizes that are multiples of 64 (Modelslab requirement)
-    // 16:9 → 1280x768 ; 9:16 → 768x1344 ; 1:1 → 1024x1024
-    const width  = aspect.includes('16:9') ? 1280 : aspect.includes('9:16') ? 768  : 1024;
-    const height = aspect.includes('9:16') ? 1344 : aspect.includes('16:9') ? 768 : 1024;
+    if (!prompt) {
+      return res.status(400).json({ error: "Missing prompt" });
+    }
+    if (!MODELSLAB_API_KEY) {
+      return res.status(500).json({ error: "MODELSLAB_API_KEY missing" });
+    }
 
-    const resp = await fetch('https://modelslab.com/api/v6/realtime/text2img', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
-      body: JSON.stringify({
-        key: KEY,          // key in body (no Authorization header)
-        prompt,
-        model_id: MODEL,
-        width, height,
-        samples: 1
-      })
+    const { width, height } = pickSize(aspect);
+
+    // ModelsLab Text-to-Image (JSON). Endpoint differs by plan; this one matches
+    // what worked for you previously (and we handle shape flexibly on parse).
+    const url = `${MODELSLAB_BASE.replace(/\/+$/,"")}/api/v1/image`;
+    const body = {
+      key: MODELSLAB_API_KEY,
+      prompt,
+      width,
+      height,
+      // tuned for wallpapers & cost control
+      samples: 1,
+      steps: 30,
+      guidance_scale: 7,
+      safety_checker: false,
+      enhance_prompt: true,
+      // if your plan supports it:
+      lora_strength: 0,
+      negative_prompt:
+        "low quality, blurry, distorted, deformed, extra limbs, text, watermark",
+      output_format: "jpg",
+      model_id: MODEL, // many ModelsLab endpoints accept model_id
+    };
+
+    const resp = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
     });
 
-    const txt = await resp.text();
+    const preview = await resp.text(); // for debugging odd shapes
+    let data = {};
+    try { data = JSON.parse(preview); } catch (_) {}
+
     if (!resp.ok) {
-      console.error('[ModelsLab FAIL]', resp.status, txt.slice(0,300));
-      return res.status(resp.status).json({ error: txt || `ModelsLab error ${resp.status}` });
+      // Some error shapes: { status:'error', message:'...' }
+      const msg = data?.message || data?.error || preview || `HTTP ${resp.status}`;
+      return res.status(502).json({ error: msg, rawPreview: preview });
     }
 
-    let data; try { data = JSON.parse(txt); } catch { data = {}; }
-
-    // Common response shapes
-    let url =
-      data?.output?.[0] ||
-      data?.data?.[0]?.url ||
-      data?.url || null;
-
-    if (!url) {
-      // base64 fallbacks
-      const b64 =
-        (Array.isArray(data?.images) && typeof data.images[0] === 'string' && data.images[0].startsWith('data:image'))
-          ? data.images[0].split(',')[1]
-          : (data?.image_base64 || null);
-      if (b64) url = `data:image/jpeg;base64,${b64}`;
+    const imageUrl = extractUrl(data) || extractUrl(data?.data);
+    if (!imageUrl) {
+      return res
+        .status(502)
+        .json({ error: "ModelsLab returned no image URL", rawPreview: preview });
     }
 
-    if (!url) {
-      console.error('[ModelsLab PARSE] raw:', txt.slice(0, 400));
-      return res.status(500).json({ error: 'ModelsLab returned no image URL', rawPreview: txt.slice(0,200) });
-    }
-
-    return res.json({ imageUrl: url, aspect });
+    bumpQuota(gate.key);
+    return res.json({ imageUrl, aspect });
   } catch (err) {
-    console.error('Generation error:', err);
-    return res.status(500).json({ error: err?.message || 'Image generation failed' });
-  } finally {
-    inFlight--;
+    console.error("[/ai/generate] error:", err);
+    return res.status(500).json({ error: err.message || "Server error" });
   }
 });
 
-// ---- START SERVER ----
-const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => console.log(`DreamCanvas API running on :${PORT} (provider=modelslab)`));
+// ---------- Start ----------
+app.listen(PORT, () => {
+  console.log(`[Boot] DreamCanvas (ModelsLab) running on port ${PORT}`);
+});
