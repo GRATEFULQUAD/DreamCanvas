@@ -1,11 +1,11 @@
-// server.js — CommonJS, ModelsLab v6, CORS, aspect fix, health
+// server.js — DreamCanvas with ModelsLab v6
 require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
 
 const app = express();
 
-// --- CORS: allow your app + local dev
+// --- CORS setup ---
 const ALLOW_ORIGINS = [
   "https://dreamcanvas-fxui.onrender.com",
   "http://localhost:3000",
@@ -20,20 +20,20 @@ app.use(cors({
 }));
 app.use(express.json({ limit: "1mb" }));
 
-// --- ENV
+// --- ENV setup ---
 const PORT = process.env.PORT || 10000;
 const MODELSLAB_API_KEY = (process.env.MODELSLAB_API_KEY || "").trim();
 const MODEL = (process.env.MODELSLAB_MODEL || "realistic-vision-v5.1").trim();
 
-// --- helpers
+// --- helper: aspect -> width/height ---
 function dimsFromAspect(aspect = "16:9") {
   const a = String(aspect).replace("x", ":").trim();
-  if (a === "9:16")  return { width: 720,  height: 1280 }; // portrait
-  if (a === "16:9")  return { width: 1280, height: 720  }; // landscape
-  return { width: 1024, height: 1024 };                    // fallback square
+  if (a === "9:16")  return { width: 720, height: 1280 };
+  if (a === "16:9")  return { width: 1280, height: 720 };
+  return { width: 1024, height: 1024 };
 }
 
-// --- health
+// --- health check ---
 app.get("/health", (req, res) => {
   res.json({
     ok: true,
@@ -42,12 +42,12 @@ app.get("/health", (req, res) => {
     model: MODEL,
     donate: process.env.PAYPAL_FULL_URL || "https://paypal.me/tomkumaton?locale.x=en_US&country.x=US",
     donateMessage:
-      "You do NOT need to — but if you’d like to help with costs (plus I’ll be your best friend 💜), you can donate to my Picture Fund. It is in no way required to get pictures — it’s just my way of saying YOU ARE AWESOME.",
+      "You do NOT need to — but if you’d like to help with costs (and I’ll be your best friend 💜), you can donate to my Picture Fund. It is in no way required to get pictures — it’s just my way of saying YOU ARE AWESOME.",
     time: new Date().toISOString(),
   });
 });
 
-// --- generate
+// --- image generation ---
 app.post("/ai/generate", async (req, res) => {
   try {
     const { prompt = "", aspect = "16:9" } = req.body || {};
@@ -59,21 +59,22 @@ app.post("/ai/generate", async (req, res) => {
     const body = {
       prompt: prompt.trim(),
       model: MODEL,
-      model_id: MODEL,          // some accounts read model_id
+      model_id: MODEL,
       width,
       height,
       samples: 1,
       steps: 28,
       guidance_scale: 7,
       safety_checker: false,
-      output_format: "url"
+      output_format: "url",
+      key: MODELSLAB_API_KEY   // 👈 pass key in body
     };
 
     const resp = await fetch("https://modelslab.com/api/v6/realtime/text2img", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "Authorization": `Bearer ${MODELSLAB_API_KEY}`,
+        "Authorization": `Bearer ${MODELSLAB_API_KEY}`, // 👈 also send in header
       },
       body: JSON.stringify(body),
     });
@@ -86,7 +87,6 @@ app.post("/ai/generate", async (req, res) => {
       return res.status(resp.status).json({ error: "ModelsLab error", rawPreview: text });
     }
 
-    // normalize URL
     let imageUrl =
       data?.imageUrl ||
       data?.url ||
@@ -106,7 +106,7 @@ app.post("/ai/generate", async (req, res) => {
   }
 });
 
-// --- boot
+// --- boot server ---
 app.listen(PORT, () => {
-  console.log(`[Boot] DreamCanvas (ModelsLab) on :${PORT}`);
+  console.log(`[Boot] DreamCanvas (ModelsLab) running on :${PORT}`);
 });
