@@ -1,20 +1,54 @@
-// === Add/replace these near your existing helpers ===
+// server.js — DreamCanvas (ModelsLab v6, style-driven)
+require("dotenv").config();
+const express = require("express");
+const cors = require("cors");
 
-// Strong style map (backend is the single source of truth)
+// ---------- Config ----------
+const PORT = process.env.PORT || 10000;
+const MODELSLAB_API_KEY = (process.env.MODELSLAB_API_KEY || "").trim();
+// You can change default model in Render env later, e.g. "realistic-vision-v5.1"
+const DEFAULT_MODEL = (process.env.MODELSLAB_MODEL || "realistic-vision-v5.1").trim();
+
+// ---------- CORS (allow your app origins) ----------
+const ALLOW = new Set([
+  "https://dreamcanvas-fxui.onrender.com", // your Base44 app URL
+  "http://localhost:3000",
+  "http://localhost:5173",
+]);
+const app = express();
+app.use(cors({
+  origin(origin, cb) {
+    if (!origin) return cb(null, true);
+    cb(null, ALLOW.has(origin));
+  },
+  methods: ["GET","POST","OPTIONS"],
+  allowedHeaders: ["Content-Type","Authorization"],
+}));
+app.use(express.json({ limit: "1mb" }));
+
+// ---------- Helpers ----------
+function dimsFromAspect(aspect = "16:9") {
+  const a = String(aspect).replace("x", ":").trim();
+  if (a === "9:16")  return { width: 768,  height: 1344 };
+  if (a === "16:9")  return { width: 1344, height: 768  };
+  return { width: 1024, height: 1024 };
+}
+
+// One source of truth for style prompts (backend composes)
 const STYLE_MAP = {
   realistic: {
     prefix:  "photorealistic, natural lighting, detailed textures, depth of field",
-    negative:"cartoon, comic, pop art, 3d plastic, low detail, watermark, text, logo",
+    negative:"cartoon, comic, pop art, plastic 3d, low detail, watermark, text, logo",
     cfg: 6.0,
   },
   cyberpunk: {
-    prefix:  "neon cyberpunk, rain-soaked streets, reflective puddles, holograms, volumetric fog, teal-magenta rim lighting",
+    prefix:  "neon cyberpunk, rainy night, reflective puddles, holograms, volumetric fog, teal-magenta rim lighting",
     negative:"pastel cute, watercolor bleed, medieval, pop art dots, plastic 3d",
     cfg: 8.0,
   },
   anime: {
     prefix:  "ANIME style, clean line art, cel shading, big expressive eyes, flat vibrant colors",
-    negative:"photoreal skin pores, film grain, plastic 3d render, pop art dots",
+    negative:"photoreal pores, film grain, plastic 3d render, pop art dots",
     cfg: 8.6,
   },
   comic: {
@@ -38,42 +72,52 @@ const STYLE_MAP = {
     cfg: 9.2,
   },
 };
-
 function pickStyle(style) {
   const key = String(style || "").toLowerCase();
   return STYLE_MAP[key] || STYLE_MAP.realistic;
 }
 
-function dimsFromAspect(aspect = "16:9") {
-  const a = String(aspect).replace("x", ":").trim();
-  if (a === "9:16")  return { width: 768, height: 1344 };
-  if (a === "16:9")  return { width: 1344, height: 768 };
-  return { width: 1024, height: 1024 };
-}
+// ---------- Health ----------
+app.get("/health", (req, res) => {
+  res.json({
+    ok: true,
+    provider: "modelslab",
+    hasKey: Boolean(MODELSLAB_API_KEY),
+    model: DEFAULT_MODEL,
+    time: new Date().toISOString(),
+  });
+});
 
-// === Inside your /ai/generate handler, replace the body-build section with this ===
-
+// ---------- Generate ----------
 app.post("/ai/generate", async (req, res) => {
   try {
-    const { prompt = "", aspect = "16:9", style = "realistic", seed } = req.body || {};
     if (!MODELSLAB_API_KEY) return res.status(401).json({ error: "Missing MODELSLAB_API_KEY" });
-    if (!prompt.trim())     return res.status(400).json({ error: "Missing prompt" });
+
+    const { prompt = "", aspect = "16:9", style = "realistic", seed } = req.body || {};
+    if (!prompt.trim()) return res.status(400).json({ error: "Missing prompt" });
 
     const { width, height } = dimsFromAspect(aspect);
     const S = pickStyle(style);
 
-    // Backend composes the final prompt (frontend sends raw prompt + style only)
     const finalPrompt = `${S.prefix}. ${prompt.trim()}`.trim();
     const negative    = S.negative || "";
     const cfg         = typeof S.cfg === "number" ? S.cfg : 7.0;
 
-    const providerBody = {
+    // Debug line so you can see what was sent
+    console.log("[ai] gen", {
+      aspect, style, cfg, width, height,
+      promptPreview: finalPrompt.slice(0, 120),
+      seed: seed ?? "new",
+    });
+
+    const body = {
       key: MODELSLAB_API_KEY,
       model: DEFAULT_MODEL,
       model_id: DEFAULT_MODEL,
       prompt: finalPrompt,
       negative_prompt: negative,
       width, height,
+      samples: 1,
       steps: 32,
       guidance_scale: cfg,
       safety_checker: false,
@@ -81,19 +125,14 @@ app.post("/ai/generate", async (req, res) => {
       ...(seed ? { seed } : {}),
     };
 
-    // Debug log so we can SEE the style & cfg used
-    console.log("[ai] gen", {
-      aspect, style, cfg, width, height,
-      promptPreview: finalPrompt.slice(0, 120)
-    });
-
+    // Node 18+ has global fetch on Render
     const resp = await fetch("https://modelslab.com/api/v6/realtime/text2img", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
         Authorization: `Bearer ${MODELSLAB_API_KEY}`,
       },
-      body: JSON.stringify(providerBody),
+      body: JSON.stringify(body),
     });
 
     const text = await resp.text();
@@ -122,4 +161,9 @@ app.post("/ai/generate", async (req, res) => {
     console.error("Generate error:", err);
     res.status(500).json({ error: err.message || "Server error" });
   }
+});
+
+// ---------- Boot ----------
+app.listen(PORT, () => {
+  console.log(`[Boot] DreamCanvas (ModelsLab) running on :${PORT}`);
 });
