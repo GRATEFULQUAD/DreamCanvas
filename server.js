@@ -1,40 +1,190 @@
-// server.js — DreamCanvas (ModelsLab v6, style-driven)
+// server.js — DreamCanvas (ModelsLab v6, style steering + seeds)
 require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
 
-// ---------- Config ----------
+// ---------- App ----------
+const app = express();
+app.use(express.json({ limit: "1mb" }));
+
+// Permissive CORS so Base44 preview + your site both work
+app.use(
+  cors({
+    origin: true, // reflect the request origin
+    methods: ["GET", "POST", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"],
+    credentials: false,
+  })
+);
+
+// ---------- ENV ----------
 const PORT = process.env.PORT || 10000;
 const MODELSLAB_API_KEY = (process.env.MODELSLAB_API_KEY || "").trim();
-// You can change default model in Render env later, e.g. "realistic-vision-v5.1"
-const DEFAULT_MODEL = (process.env.MODELSLAB_MODEL || "realistic-vision-v5.1").trim();
-
-// ---------- CORS (allow your app origins) ----------
-const ALLOW = new Set([
-  "https://dreamcanvas-fxui.onrender.com", // your Base44 app URL
-  "http://localhost:3000",
-  "http://localhost:5173",
-]);
-const app = express();
-app.use(cors({
-  origin(origin, cb) {
-    if (!origin) return cb(null, true);
-    cb(null, ALLOW.has(origin));
-  },
-  methods: ["GET","POST","OPTIONS"],
-  allowedHeaders: ["Content-Type","Authorization"],
-}));
-app.use(express.json({ limit: "1mb" }));
+const MODEL = (process.env.MODELSLAB_MODEL || "realistic-vision-v5.1").trim();
+const DONATE_URL =
+  process.env.PAYPAL_FULL_URL ||
+  "https://paypal.me/tomkumaton?locale.x=en_US&country.x=US";
 
 // ---------- Helpers ----------
 function dimsFromAspect(aspect = "16:9") {
   const a = String(aspect).replace("x", ":").trim();
-  if (a === "9:16")  return { width: 768,  height: 1344 };
-  if (a === "16:9")  return { width: 1344, height: 768  };
+  if (a === "9:16") return { width: 720, height: 1280 };
+  if (a === "16:9") return { width: 1280, height: 720 };
   return { width: 1024, height: 1024 };
 }
 
-// One source of truth for style prompts (backend composes)
+// Strong style steering (feel free to tweak lines)
+const STYLE_PROMPTS = {
+  realistic: "ultra realistic, photo quality, cinematic lighting, detailed textures",
+  cyberpunk:
+    "cyberpunk style, neon glow, rainy futuristic city, reflections, holograms, sci-fi atmosphere",
+  anime: "anime illustration, cel shading, crisp line art, vibrant colors, expressive eyes",
+  comic:
+    "comic book illustration, bold black outlines, halftone shading, dramatic poses, dynamic action",
+  fantasy:
+    "high fantasy concept art, mystical lighting, ethereal atmosphere, dramatic depth, painterly detail",
+  "3d-pop":
+    "3D render, pop-art palette, glossy materials, soft studio lighting, clean background",
+  popart:
+    "pop art style, bright flat colors, heavy outlines, posterized shading, graphic composition",
+};
+
+// A small nudge to prevent weird merges
+const NEGATIVE_BASE =
+  "blurry, lowres, distorted, extra limbs, extra fingers, duplicated faces, merged characters, deformed, watermark, text, logo, signature, jpeg artifacts";
+
+// Build final prompt safely
+function buildPrompt(userPrompt = "", styleKey = "realistic") {
+  const stylePrompt = STYLE_PROMPTS[styleKey] || STYLE_PROMPTS.realistic;
+
+  let finalPrompt = `${userPrompt.trim()}\nStyle: ${stylePrompt}`;
+
+  // If user lists multiple things, ask explicitly for separation
+  const commaCount = (userPrompt.match(/,/g) || []).length;
+  if (commaCount >= 2 || / and | with | plus | vs /i.test(userPrompt)) {
+    finalPrompt +=
+      "\nSeparate subjects, clearly distinct, do not merge character features, balanced layout";
+  }
+
+  return finalPrompt;
+}
+
+// ---------- Health ----------
+app.get("/health", (_req, res) => {
+  res.json({
+    ok: true,
+    provider: "modelslab",
+    hasKey: Boolean(MODELSLAB_API_KEY),
+    model: MODEL,
+    donate: DONATE_URL,
+    donateMessage:
+      "You do NOT need to — but if you’d like to help with costs (and I’ll be your best friend 💜), you can donate to my Picture Fund. It is in no way required to get pictures — it’s just my way of saying YOU ARE AWESOME.",
+    time: new Date().toISOString(),
+  });
+});
+
+// ---------- Generate ----------
+app.post("/ai/generate", async (req, res) => {
+  try {
+    if (!MODELSLAB_API_KEY) {
+      return res.status(401).json({ error: "Missing MODELSLAB_API_KEY" });
+    }
+
+    const {
+      prompt = "",
+      style = "realistic", // <- frontend should send this; we still default
+      aspect = "16:9",
+      seed, // optional number for consistent variations (reframe)
+    } = req.body || {};
+
+    if (!prompt.trim()) {
+      return res.status(400).json({ error: "Missing prompt" });
+    }
+
+    const { width, height } = dimsFromAspect(aspect);
+    const fullPrompt = buildPrompt(prompt, style);
+
+    const body = {
+      key: MODELSLAB_API_KEY, // body key (ModelsLab supports it)
+      model: MODEL,
+      model_id: MODEL,
+      prompt: fullPrompt,
+      negative_prompt: NEGATIVE_BASE,
+      width,
+      height,
+      samples: 1,
+      steps: 28,
+      guidance_scale: 7,
+      safety_checker: false,
+      output_format: "url",
+      ...(typeof seed === "number" ? { seed } : {}),
+    };
+
+    const resp = await fetch(
+      "https://modelslab.com/api/v6/realtime/text2img",
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          // Many ModelsLab endpoints also accept Bearer — keeping both is harmless.
+          Authorization: `Bearer ${MODELSLAB_API_KEY}`,
+        },
+        body: JSON.stringify(body),
+      }
+    );
+
+    const preview = await resp.text();
+    let data = {};
+    try {
+      data = JSON.parse(preview);
+    } catch {
+      // keep raw preview for debugging
+    }
+
+    if (!resp.ok) {
+      return res.status(resp.status).json({
+        error: "ModelsLab error",
+        rawPreview: preview,
+      });
+    }
+
+    // Normalize common shapes
+    const imageUrl =
+      data?.imageUrl ||
+      data?.url ||
+      (Array.isArray(data?.output) && data.output[0]) ||
+      (Array.isArray(data?.images) && (data.images[0]?.url || data.images[0])) ||
+      (Array.isArray(data?.data) && (data.data[0]?.url || data.data[0])) ||
+      null;
+
+    const returnedSeed =
+      data?.seed ??
+      data?.meta?.seed ??
+      (typeof data?.data?.seed === "number" ? data.data.seed : undefined);
+
+    if (!imageUrl) {
+      return res.status(500).json({
+        error: "ModelsLab returned no image URL",
+        rawPreview: preview,
+      });
+    }
+
+    res.json({
+      imageUrl,
+      aspect,
+      style,
+      ...(typeof returnedSeed === "number" ? { seed: returnedSeed } : {}),
+    });
+  } catch (err) {
+    console.error("Generate error:", err);
+    res.status(500).json({ error: err.message || "Server error" });
+  }
+});
+
+// ---------- Boot ----------
+app.listen(PORT, () => {
+  console.log(`[Boot] DreamCanvas (ModelsLab) running on :${PORT}`);
+});// One source of truth for style prompts (backend composes)
 const STYLE_MAP = {
   realistic: {
     prefix:  "photorealistic, natural lighting, detailed textures, depth of field",
